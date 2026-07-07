@@ -4,8 +4,10 @@
 // Port notes vs the original EPD_Painter demo:
 //   - No paint() and no full-screen redraws: the sketch draws only DELTAS
 //     (erase-old + draw-new per ball, one white rect per killed brick) and
-//     the 50Hz simulation tick moves the ink. The original ran ~5fps with a
-//     blocking paint per frame; this animates every 20ms.
+//     the 50Hz simulation tick moves the ink. The original hit ~20fps with
+//     blocking paints — the fastest e-paper driver out there. This edition
+//     changes the axis of speed: 50 game steps/s of command latency, with
+//     every pixel's transition running concurrently instead of per-frame.
 //   - Every ball drags a fading comet tail — pixels mid-flight back to
 //     white. That is the ink physics rendering motion blur, not a shader.
 //   - Composite draws are wrapped in beginUpdate()/endUpdate() so the
