@@ -76,6 +76,11 @@ void EPD_Painter2::setGreyPositions(const uint8_t pos[16]) {
 void EPD_Painter2::sendRow(bool firstLine, bool lastLine) {
   while (LCD_CAM.lcd_user.lcd_start) {}
 
+  // Dose control: extend the currently-selected row's field time before
+  // advancing the gate. Uniform across the frame (neutral rows unaffected —
+  // no drive voltage, just time).
+  if (_dwell_us) EPD2_DELAY_US(_dwell_us);
+
   dma_descriptor_t *desc;
   if (dma_buffer == dma_buffer1) {
     desc = &dma_desc1;

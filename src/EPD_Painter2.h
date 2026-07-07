@@ -161,6 +161,12 @@ public:
   // Tune with the staircase test pattern; entries must be ascending, 0..31.
   void setGreyPositions(const uint8_t pos[16]);
 
+  // Extra dwell (µs) added to every row's select time during the scan —
+  // increases the per-pulse ink dose. 0 = hardware minimum (~5µs select).
+  // Each µs adds ~0.54ms to the frame scan (540 rows); keep ≤ 10.
+  // Calibration lever for the trajectory table; not needed in normal use.
+  void setPulseDwell(uint8_t us) { _dwell_us = us; }
+
   // Block until every pixel has arrived at its target (optional).
   void waitSettled(uint32_t timeout_ms = 5000);
 
@@ -181,6 +187,7 @@ private:
 
   int packed_row_bytes = 0;         // width / 4 (2 bits per pixel drive data)
   int dma_row_bytes    = 0;         // packed_row_bytes + row_pad_bytes
+  volatile uint8_t _dwell_us = 0;   // extra per-row select time (dose control)
 
   static constexpr int MAX_ROWS = 1024;
   static constexpr int CHUNK_PX = 64;          // dirty-tracking granularity
