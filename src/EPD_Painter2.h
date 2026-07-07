@@ -182,13 +182,21 @@ private:
   int packed_row_bytes = 0;         // width / 4 (2 bits per pixel drive data)
   int dma_row_bytes    = 0;         // packed_row_bytes + row_pad_bytes
 
+  static constexpr int MAX_ROWS = 1024;
+  static constexpr int CHUNK_PX = 64;          // dirty-tracking granularity
+
   // ---- Simulation state ----
   uint8_t* _target = nullptr;       // 1 byte/px, PSRAM: user grey 0-15
   uint8_t* _state  = nullptr;       // 1 byte/px, PSRAM: pulse POSITION (0.._posLUT[15])
   uint8_t  _posLUT[16];             // grey → pulse position (calibration)
 
-  static constexpr int MAX_ROWS = 1024;
-  static constexpr int CHUNK_PX = 64;          // dirty-tracking granularity
+  // Per-frame staging: drive rows are fully computed here (phase 1) before
+  // any of them is sent (phase 2). The scan-out loop must be gapless — a
+  // paused scan parks the gate on one row with OE live and over-doses it,
+  // leaving a torn line whose state ledger believes it was driven correctly.
+  uint8_t* _staging = nullptr;                 // height × packed_row_bytes
+  uint32_t _frameActive[MAX_ROWS / 32];        // rows staged this frame
+
   std::atomic<uint32_t> _rowMask[MAX_ROWS / 32];
   // Per-row bitmask of dirty 64px column chunks (bit c = pixels c*64..c*64+63).
   // The tick kernel only reads/writes PSRAM for dirty chunks — this is what

@@ -273,6 +273,16 @@ bool EPD_Painter2::begin() {
   memset(_target, 0, npx);   // all white
   memset(_state,  0, npx);
 
+  // Frame staging — internal RAM preferred (fast phase-2 memcpys), PSRAM ok.
+  const size_t staging_size = (size_t)packed_row_bytes * _config.height;
+  _staging = static_cast<uint8_t *>(
+    heap_caps_aligned_alloc(16, staging_size, MALLOC_CAP_INTERNAL));
+  if (!_staging) {
+    _staging = static_cast<uint8_t *>(
+      heap_caps_aligned_alloc(16, staging_size, MALLOC_CAP_SPIRAM));
+  }
+  if (!_staging) return false;
+
   // ---- Power driver ----
   if (_config.power.tps_addr != -1) {
     auto* pc = new EPD2_PowerCtl();
@@ -508,35 +518,51 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out) {
 }
 
 // =============================================================================
-// tickFrame() — one simulation frame: drive every row once (active rows get
-// their pulse, inactive rows get neutral). Returns true if work remains.
+// tickFrame() — one simulation frame in two strictly separated phases.
+//
+// Phase 1 (compute, interruptible): advance every active row's pixels and
+// write their drive data into _staging. Holds the draw mutex once, so
+// beginUpdate()/endUpdate() composites are atomic vs the simulation, and
+// PSRAM traffic/contention happens HERE, not during the scan.
+//
+// Phase 2 (scan-out, gapless): stream all rows back-to-back over DMA with
+// nothing between sendRow()s but a memcpy/memset. This must never pause:
+// between rows the gate driver holds one row selected with OE live, so a
+// stalled scan over-doses that row — the torn-line bug. State bookkeeping
+// happened in phase 1, so any stall risk here no longer diverges the ledger,
+// and the loop contains no locks or PSRAM writes to stall on.
+//
+// Returns true if work remains.
 // =============================================================================
 bool EPD_Painter2::tickFrame() {
   const int H = _config.height;
   bool anyLeft = false;
   int activeRows = 0;
 
+  // ---- Phase 1: simulate + stage ----
+  memset(_frameActive, 0, sizeof(_frameActive));
+  xSemaphoreTake(_draw_mtx, portMAX_DELAY);
   for (int row = 0; row < H; row++) {
     const uint32_t bit = 1u << (row & 31);
-    const bool rowActive =
-      (_rowMask[row >> 5].load(std::memory_order_relaxed) & bit) != 0;
+    if (!(_rowMask[row >> 5].load(std::memory_order_relaxed) & bit)) continue;
 
-    if (rowActive) {
-      activeRows++;
-      memset(dma_buffer, 0x00, packed_row_bytes);   // neutral base; kernel fills dirty chunks
-      // Hold the draw mutex per row: an open beginUpdate()/endUpdate() block
-      // pauses the scan at this row boundary, so composite draws are atomic
-      // with respect to the kernel and no intermediate target state is read.
-      xSemaphoreTake(_draw_mtx, portMAX_DELAY);
-      const bool still = rowKernel(row, dma_buffer);
-      xSemaphoreGive(_draw_mtx);
-      if (!still) {
-        // Benign race: a draw between our scan and this clear can lose a
-        // wakeup; it self-heals on the next draw to this row.
-        _rowMask[row >> 5].fetch_and(~bit, std::memory_order_relaxed);
-      } else {
-        anyLeft = true;
-      }
+    activeRows++;
+    uint8_t* stage = _staging + (size_t)row * packed_row_bytes;
+    memset(stage, 0x00, packed_row_bytes);   // neutral base; kernel fills dirty chunks
+    const bool still = rowKernel(row, stage);
+    _frameActive[row >> 5] |= bit;
+    if (!still) {
+      _rowMask[row >> 5].fetch_and(~bit, std::memory_order_relaxed);
+    } else {
+      anyLeft = true;
+    }
+  }
+  xSemaphoreGive(_draw_mtx);
+
+  // ---- Phase 2: gapless scan-out ----
+  for (int row = 0; row < H; row++) {
+    if (_frameActive[row >> 5] & (1u << (row & 31))) {
+      memcpy(dma_buffer, _staging + (size_t)row * packed_row_bytes, packed_row_bytes);
     } else {
       memset(dma_buffer, 0x00, packed_row_bytes);
     }
