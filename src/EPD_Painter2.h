@@ -119,6 +119,7 @@ public:
       uint32_t lastTickUs;    // duration of the last driven frame
       uint32_t maxTickUs;     // worst frame since reset
       uint16_t activeRows;    // rows with in-flight pixels, last frame
+      uint16_t pausedRows;    // rows deferred by the compute budget, last frame
       bool     powered;       // panel rails currently on
   };
 
@@ -204,6 +205,18 @@ public:
   // consecutive ticks instead of taking rests.
   void setTickRate(uint16_t hz) { _tick_override = hz; }
 
+  // Rail commitment — for two-tone content (video, fast animation). Once a
+  // pixel starts a journey it LATCHES its destination rail and ignores
+  // retargets until it arrives; fast target flips make it skip transitions
+  // it can't physically complete (per-pixel frame dropping). Every journey
+  // then ends at a rail, which re-anchors the ink — without this, mid-
+  // flight reversals accumulate ledger-vs-ink drift (symmetric bookkeeping,
+  // asymmetric physics) and fast scenes decay into uniform grey soup.
+  // Uses state bits 7 (committed) / 6 (direction); positions must be <=31.
+  // Set once, before drawing; greys other than the rails lose latch
+  // precision, so keep this off for true greyscale content.
+  void setRailCommit(bool on) { _rail_commit = on; }
+
   // Compute budget (µs) for the tick's simulate phase. 0 = unlimited. When
   // a full-screen storm of changes exceeds the budget, the remaining active
   // rows PAUSE for that tick — they stage nothing, the scan writes them
@@ -236,6 +249,7 @@ private:
   volatile uint32_t _pulse_window_us = 0;   // 0 = field stays on for full tick
   volatile uint8_t _travel_gain = 0;   // coarse pulse worth, in fine positions
   volatile uint32_t _compute_budget_us = 0;  // phase-1 cap; 0 = unlimited
+  volatile bool _rail_commit = false;  // latch journeys to their rail
   uint16_t _rowCursor = 0;     // rotating start row for budgeted phase 1
   uint16_t _tick_override = 0; // setTickRate(); applied in begin()
   bool _rested      = false;   // pulse ≥ tick: rest ticks replace neutral pass
@@ -280,6 +294,7 @@ private:
   std::atomic<uint32_t> _st_lastUs{0};
   std::atomic<uint32_t> _st_maxUs{0};
   std::atomic<uint16_t> _st_activeRows{0};
+  std::atomic<uint16_t> _st_pausedRows{0};
 
   // ---- Hardware drivers ----
   EPD2_PowerDriver* _powerDriver = nullptr;

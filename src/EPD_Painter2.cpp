@@ -474,6 +474,7 @@ EPD_Painter2::Stats EPD_Painter2::getStats() {
   s.lastTickUs = _st_lastUs.load(std::memory_order_relaxed);
   s.maxTickUs  = _st_maxUs.load(std::memory_order_relaxed);
   s.activeRows = _st_activeRows.load(std::memory_order_relaxed);
+  s.pausedRows = _st_pausedRows.load(std::memory_order_relaxed);
   s.powered    = _powered;
   return s;
 }
@@ -491,11 +492,15 @@ EPD_Painter2::Stats EPD_Painter2::getStats() {
 // Returns true if any pixel in the row is still in flight afterwards.
 // out must already contain neutral (zero) drive data for clean chunks.
 // =============================================================================
+#pragma GCC push_options
+#pragma GCC optimize("O3")
 bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
   const uint8_t* rowTgt = _target + (size_t)row * _config.width;
   uint8_t*       rowCur = _state  + (size_t)row * _config.width;
   const uint8_t gain    = _travel_gain;
   const bool boosted    = (gain > 1) && (_pulse_window_us > 0);
+  const bool commit     = _rail_commit;
+  const uint8_t blackPos = _posLUT[15];
 
   uint16_t chunks = _chunkMask[row].load(std::memory_order_relaxed);
   uint16_t settled = 0;
@@ -511,8 +516,15 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
     for (int b = 0; b < CHUNK_PX / 4; b++) {
       uint8_t o = 0;
       for (int i = 0; i < 4; i++) {
-        const uint8_t cv = cur[i];
-        const uint8_t tv = _posLUT[tgt[i] & 0x0F];   // grey → pulse position
+        const uint8_t raw = cur[i];
+        const uint8_t ftv = _posLUT[tgt[i] & 0x0F];  // fresh target position
+        uint8_t cv = raw, fl = 0, tv = ftv;
+        if (commit) {
+          cv = raw & 0x1F;
+          fl = raw & 0xC0;
+          if (fl & 0x80)          tv = (fl & 0x40) ? blackPos : 0;  // honor latch
+          else if (cv != ftv)     fl = 0x80 | (ftv > cv ? 0x40 : 0); // new journey
+        }
         const uint8_t delta = (cv > tv) ? (uint8_t)(cv - tv) : (uint8_t)(tv - cv);
         uint8_t d = 0, nv = cv;
         // How far does this pixel move this tick?
@@ -538,10 +550,15 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
         if (s) {
           if (cv < tv) { d = DRIVE_DARK;  nv = cv + s; }
           else         { d = DRIVE_LIGHT; nv = cv - s; }
-          cur[i] = nv;
           _anyDrive = true;
         }
-        if (nv != tv) {
+        if (commit) {
+          if (nv == tv) fl = 0;   // arrived: unlatch, fresh target next tick
+          if ((nv | fl) != raw) cur[i] = nv | fl;
+        } else if (nv != cv) {
+          cur[i] = nv;
+        }
+        if (nv != tv || (commit && !fl && nv != ftv)) {
           chunkActive = true;
           if (!_rested) {   // classify remaining work → frame scheduling
             const uint8_t rem = (nv > tv) ? (uint8_t)(nv - tv) : (uint8_t)(tv - nv);
@@ -564,6 +581,7 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
   }
   return (chunks & ~settled) != 0;
 }
+#pragma GCC pop_options
 
 // =============================================================================
 // tickFrame() — one simulation frame in two strictly separated phases.
@@ -619,9 +637,15 @@ bool EPD_Painter2::tickFrame() {
 
   // ---- Phase 1: simulate + stage ----
   memset(_frameActive, 0, sizeof(_frameActive));
-  const int64_t p1Start = esp_timer_get_time();
   const uint32_t budget = _compute_budget_us;
   xSemaphoreTake(_draw_mtx, portMAX_DELAY);
+  int totalActive = 0;
+  for (int w = 0; w < (H + 31) / 32; w++)
+    totalActive += __builtin_popcount(_rowMask[w].load(std::memory_order_relaxed));
+  // Budget clock starts AFTER the mutex: it caps compute, not queueing —
+  // otherwise a draw holding the lock eats the budget and the tick stages
+  // nothing (every pixel starves mid-journey and the panel goes grey).
+  const int64_t p1Start = esp_timer_get_time();
   for (int k = 0; k < H; k++) {
     const int row = (_rowCursor + k) % H;   // rotating start: paused rows go first
     const uint32_t bit = 1u << (row & 31);
@@ -689,6 +713,9 @@ bool EPD_Painter2::tickFrame() {
   }
 
   _st_activeRows.store((uint16_t)activeRows, std::memory_order_relaxed);
+  _st_pausedRows.store(
+      (uint16_t)(totalActive > activeRows ? totalActive - activeRows : 0),
+      std::memory_order_relaxed);
   return anyLeft;
 }
 
