@@ -285,6 +285,14 @@ bool EPD_Painter2::begin() {
     heap_caps_aligned_alloc(16, npx * sizeof(int16_t), MALLOC_CAP_SPIRAM));
   if (_dc) memset(_dc, 0, npx * sizeof(int16_t));
 
+  // Deghost grid + the sustain rows the scrub pulses ride on.
+  _gridW = (_config.width  + GHOST_CELL - 1) / GHOST_CELL;
+  _gridH = (_config.height + GHOST_CELL - 1) / GHOST_CELL;
+  if (_gridW > GRID_MAX) _gridW = GRID_MAX;
+  if (_gridH > GRID_MAX) _gridH = GRID_MAX;
+  _sustain = static_cast<uint8_t *>(heap_caps_aligned_alloc(
+    16, (size_t)MAINT_BAND * (_config.width / 4), MALLOC_CAP_INTERNAL));
+
   // Frame staging — internal RAM preferred (fast phase-2 memcpys), PSRAM ok.
   const size_t staging_size = (size_t)packed_row_bytes * _config.height;
   _staging = static_cast<uint8_t *>(
@@ -489,6 +497,10 @@ EPD_Painter2::Stats EPD_Painter2::getStats() {
   s.pausedRows = _st_pausedRows.load(std::memory_order_relaxed);
   s.maintPulses = _st_maintPulses.load(std::memory_order_relaxed);
   s.dcPeakMs   = _st_dcPeak.load(std::memory_order_relaxed);
+  s.ghostCells = 0;
+  for (int gy = 0; gy < _gridH; gy++)
+    for (int gx = 0; gx < _gridW; gx++)
+      if (_ghostGrid[gy][gx]) s.ghostCells++;
   s.powered    = _powered;
   return s;
 }
@@ -686,6 +698,16 @@ bool EPD_Painter2::tickFrame() {
       anyLeft = true;
     }
   }
+
+  // Live deghosting: animation-heavy apps never go idle, so merge a band
+  // of maintenance pulses into this frame when pacing and budget allow.
+  // The frame type picks the pulse width: !coarse frames bank the chased
+  // short pre-charges, coarse frames carry the full-tick scrubs.
+  if (_dc && _white_refresh_s && _ghostAny && activeRows &&
+      esp_timer_get_time() >= _next_refresh_us &&
+      (!budget || (uint32_t)(esp_timer_get_time() - p1Start) < budget)) {
+    mergeMaintenance(coarse, winMs, tickMs);
+  }
   xSemaphoreGive(_draw_mtx);
 
   // ---- Phase 2: gapless scan-out ----
@@ -744,43 +766,138 @@ void EPD_Painter2::neutralFrame() {
   }
 }
 
+// Pass complete: cells that received a scrub are one treatment closer to
+// clean; re-arm the pass pacing timer.
+void EPD_Painter2::finishGhostPass() {
+  bool any = false;
+  for (int gy = 0; gy < _gridH; gy++) {
+    for (int gx = 0; gx < _gridW; gx++) {
+      if (_ghostGrid[gy][gx]) {
+        if (_cellScrubbed[gy] & (1u << gx)) _ghostGrid[gy][gx]--;
+        if (_ghostGrid[gy][gx]) any = true;
+      }
+    }
+    _cellScrubbed[gy] = 0;
+  }
+  _ghostAny = any;
+  _next_refresh_us =
+    esp_timer_get_time() + (int64_t)_white_refresh_s * 1000000LL;
+}
+
 // =============================================================================
-// maintenanceTick() — idle-time DC trim + anti-ghost white refresh.
+// mergeMaintenance() — live deghosting underneath animation.
+//
+// Called from tickFrame's phase 1 (mutex held): folds a band of deghost
+// pulses into the CURRENT frame's staging, so cells the animation dirties
+// get cleaned without waiting for idle. Pulse widths come free from the
+// frame type: on !coarse frames the field-off pass chases everything, so
+// pre-charge DARK shorts (~window) are banked; on coarse frames pulses run
+// the full tick, so that's when accounts are spent as long LIGHT scrubs.
+// Mixed workloads alternate frame types, so both halves of the cycle run.
+// Maintenance pixels are settled (their staged lanes are 0b00), so OR-ing
+// into an already-staged row can't disturb live drive data.
+// =============================================================================
+void EPD_Painter2::mergeMaintenance(bool coarse, int16_t shortMs, int16_t longMs) {
+  const int H = _config.height, W = _config.width;
+  _maintSalt = _maintSalt * 1103515245u + 12345u;
+
+  for (int n = 0; n < MAINT_BAND; n++) {
+    const int row = (_maintRow + n) % H;
+    const uint8_t* gRow = _ghostGrid[row / GHOST_CELL];
+
+    bool anyCell = false;
+    for (int gx = 0; gx < _gridW; gx++) if (gRow[gx]) { anyCell = true; break; }
+    if (!anyCell) continue;
+
+    const uint8_t* st = _state  + (size_t)row * W;
+    const uint8_t* tg = _target + (size_t)row * W;
+    int16_t*       dc = _dc     + (size_t)row * W;
+    uint8_t*    stage = _staging + (size_t)row * packed_row_bytes;
+    const uint32_t bit = 1u << (row & 31);
+    bool rowStaged = (_frameActive[row >> 5] & bit) != 0;
+
+    for (int xi = 0; xi < W; xi++) {
+      if (!gRow[xi / GHOST_CELL]) {              // hop to the next cell
+        xi += GHOST_CELL - 1 - (xi % GHOST_CELL);
+        continue;
+      }
+      if (st[xi] != 0 || (tg[xi] & 0x0F) != 0) continue;   // settled whites only
+      const uint32_t h =
+        ((uint32_t)xi * 2654435761u) ^ ((uint32_t)row * 40503u) ^ _maintSalt;
+      if (!(h & 1)) continue;                    // scattered batches
+      int16_t a = dc[xi];
+      uint8_t d = 0;
+      if (coarse) {
+        if (a >= longMs - 2) {                   // account full: the scrub
+          d = DRIVE_LIGHT;
+          a -= longMs;
+          _cellScrubbed[row / GHOST_CELL] |= (1u << (xi / GHOST_CELL));
+        }
+      } else if (a < longMs - 2) {               // bank a chased short pulse
+        d = DRIVE_DARK;
+        a += shortMs;
+      }
+      if (!d) continue;
+      if (!rowStaged) {
+        memset(stage, 0x00, packed_row_bytes);
+        _frameActive[row >> 5] |= bit;
+        rowStaged = true;
+      }
+      stage[xi >> 2] |= d << ((3 - (xi & 3)) * 2);
+      dc[xi] = a;
+      _anyDrive = true;
+      _st_maintPulses.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  const int prev = _maintRow;
+  _maintRow = (_maintRow + MAINT_BAND) % H;
+  if (_maintRow <= prev) finishGhostPass();      // wrapped: one pass complete
+}
+
+// =============================================================================
+// maintenanceTick() — idle-time deghosting (pre-charged scrub) + DC trim.
 //
 // Runs only when nothing is in flight and the rails are up. Scans a band of
-// rows per tick; any pulses due are fired as one SHORT-pulse frame: a drive
-// scan chased immediately by the field-off scan, ~one scan time (~5ms) of
-// field. Short pulses at a rail are charge without (visible) motion — the
-// ink's first-pulse-from-rail stiction is the highest on the response curve
-// (measured: the first 7ms pulse from white moved reflectance ~0.01).
+// rows per tick and fires one frame: a drive scan chased by a second scan
+// that writes 0V to short pulses (~one scan, ~5ms of field) but SUSTAINS
+// scrub pulses, which then run until the next tick's scan (or the idle
+// flush) terminates them at ~one full tick.
 //
-//   - refresh sweep (every _white_refresh_s): settled whites get one LIGHT
-//     pulse — proactive ghost erasure, booked as charge.
-//   - trim: any rail-parked pixel whose account exceeds ±TRIM_AT gets an
-//     opposing pulse; accounts head back to centre a few ms per idle tick.
+// Deghost cycle (zero net charge by construction): a white pixel in a dirty
+// cell banks short sub-threshold DARK pulses — one per pass, spread over
+// seconds, at the rail where first-pulse stiction is highest (measured:
+// 7ms from white moved reflectance ~0.01) — and once its account holds one
+// tick's worth, spends it all as a single long LIGHT pulse: the scrub that
+// actually pushes ghost particles home. The cycle ends hard against the
+// white rail, so even sub-threshold creep is self-healed. A random lottery
+// per pass scatters treatment instead of marching it in blocks.
+//
+// Trim: rail-parked pixels outside dirty cells with |account| > TRIM_AT get
+// short opposing pulses — mops up coarse-pulse booking gaps.
 // Returns true if anything was fired (caller holds off the idle power-down).
 // =============================================================================
 bool EPD_Painter2::maintenanceTick() {
   if (!_dc) return false;
   const int H = _config.height, W = _config.width;
-  static constexpr int BAND = 32;          // rows scanned per idle tick
   static constexpr int16_t TRIM_AT  = 15;  // ms of imbalance before trimming
-  static constexpr int16_t PULSE_MS = 5;   // ~one scan of field time
+  static constexpr int16_t PULSE_MS = 5;   // short pulse: ~one scan of field
+  const int16_t disMs = (int16_t)(1000 / _config.tick_hz);  // scrub length
 
-  if (_white_refresh_s && _next_refresh_us == 0)
-    _next_refresh_us = esp_timer_get_time() + (int64_t)_white_refresh_s * 1000000LL;
-  if (_white_refresh_s && _refreshRow < 0 &&
+  if (_white_refresh_s && _refreshRow < 0 && _ghostAny &&
       esp_timer_get_time() >= _next_refresh_us)
     _refreshRow = 0;
 
-  const bool refreshing = (_refreshRow >= 0);
-  const int r0 = refreshing ? _refreshRow : _maintRow;
-  const int nrows = refreshing ? ((H - r0) < BAND ? (H - r0) : BAND) : BAND;
+  const bool pass = (_refreshRow >= 0);
+  const int r0 = pass ? _refreshRow : _maintRow;
+  const int nrows = pass ? ((H - r0) < MAINT_BAND ? (H - r0) : MAINT_BAND)
+                         : MAINT_BAND;
 
-  bool bandFired[BAND] = {false};
+  bool bandFired[MAINT_BAND] = {false};
+  bool anySustain = false;
   uint32_t pulses = 0;
   int16_t peak = 0;
   const uint8_t blackPos = _posLUT[15];
+  _maintSalt = _maintSalt * 1103515245u + 12345u;
 
   xSemaphoreTake(_draw_mtx, portMAX_DELAY);
   for (int n = 0; n < nrows; n++) {
@@ -789,39 +906,59 @@ bool EPD_Painter2::maintenanceTick() {
     const uint8_t* tg = _target + (size_t)row * W;
     int16_t*       dc = _dc     + (size_t)row * W;
     uint8_t*    stage = _staging + (size_t)row * packed_row_bytes;
+    uint8_t*      sus = _sustain + (size_t)n   * packed_row_bytes;
+    const uint8_t* gRow = _ghostGrid[row / GHOST_CELL];
     bool rowFired = false;
     for (int x = 0; x < W; x += 4) {
-      uint8_t o = 0;
+      uint8_t o = 0, os = 0;
       for (int i = 0; i < 4; i++) {
         const int xi = x + i;
         const uint8_t sv = st[xi];
         uint8_t d = 0;
-        if (sv == 0 || sv >= blackPos) {     // parked at a rail
-          int16_t a = dc[xi];
-          if (refreshing && sv == 0 && (tg[xi] & 0x0F) == 0) {
-            d = DRIVE_LIGHT; a -= PULSE_MS;  // anti-ghost, booked
-          } else if (a >= TRIM_AT) {
-            d = DRIVE_LIGHT; a -= PULSE_MS;  // excess dark charge
-          } else if (a <= -TRIM_AT) {
-            d = DRIVE_DARK;  a += PULSE_MS;  // excess light charge
+        bool sustain = false;
+        const bool ghostW = (sv == 0) && (tg[xi] & 0x0F) == 0 && gRow[xi / GHOST_CELL];
+        if (ghostW) {
+          if (pass) {
+            const uint32_t h =
+              ((uint32_t)xi * 2654435761u) ^ ((uint32_t)row * 40503u) ^ _maintSalt;
+            if (h & 1) {                       // scattered batch, ~half per pass
+              int16_t a = dc[xi];
+              if (a >= disMs - 2) {            // account full: the scrub
+                d = DRIVE_LIGHT; sustain = true; anySustain = true;
+                a -= disMs;
+                _cellScrubbed[row / GHOST_CELL] |= (1u << (xi / GHOST_CELL));
+              } else {                         // bank another crumb of charge
+                d = DRIVE_DARK; a += PULSE_MS;
+              }
+              dc[xi] = a; pulses++; rowFired = true;
+              const int16_t m = (a < 0) ? -a : a;
+              if (m > peak) peak = m;
+            }
           }
+          // Between passes / off-lottery: leave in-cycle accounts alone.
+        } else if (sv == 0 || sv >= blackPos) {  // rail-parked, clean cell
+          int16_t a = dc[xi];
+          if (a >= TRIM_AT)       { d = DRIVE_LIGHT; a -= PULSE_MS; }
+          else if (a <= -TRIM_AT) { d = DRIVE_DARK;  a += PULSE_MS; }
           if (d) { dc[xi] = a; pulses++; rowFired = true; }
           const int16_t m = (a < 0) ? -a : a;
           if (m > peak) peak = m;
         }
-        o = (o << 2) | d;
+        o  = (o  << 2) | d;
+        os = (os << 2) | (sustain ? DRIVE_LIGHT : 0);
       }
       stage[x >> 2] = o;
+      sus[x >> 2]   = os;
     }
     bandFired[n] = rowFired;
   }
   xSemaphoreGive(_draw_mtx);
 
-  if (refreshing) {
+  if (pass) {
     _refreshRow += nrows;
     if (_refreshRow >= H) {
       _refreshRow = -1;
-      _next_refresh_us = esp_timer_get_time() + (int64_t)_white_refresh_s * 1000000LL;
+      finishGhostPass();
     }
   } else {
     _maintRow = (_maintRow + nrows) % H;
@@ -831,7 +968,9 @@ bool EPD_Painter2::maintenanceTick() {
   if (!pulses) return false;
   _st_maintPulses.fetch_add(pulses, std::memory_order_relaxed);
 
-  // Short-pulse frame: drive scan, then the field-off scan straight after.
+  // Drive scan, then the chase scan: shorts cut at ~one scan of field,
+  // scrub pulses re-written (sustained) — the NEXT scan ends them at ~one
+  // tick. If maintenance goes quiet before then, the idle flush does it.
   for (int row = 0; row < H; row++) {
     int n = row - r0; if (n < 0) n += H;
     if (n < nrows && bandFired[n]) {
@@ -841,7 +980,16 @@ bool EPD_Painter2::maintenanceTick() {
     }
     sendRow(row == 0, row == H - 1);
   }
-  neutralFrame();
+  for (int row = 0; row < H; row++) {
+    int n = row - r0; if (n < 0) n += H;
+    if (n < nrows && bandFired[n]) {
+      memcpy(dma_buffer, _sustain + (size_t)n * packed_row_bytes, packed_row_bytes);
+    } else {
+      memset(dma_buffer, 0x00, packed_row_bytes);
+    }
+    sendRow(row == 0, row == H - 1);
+  }
+  if (anySustain) _flushPending = true;
   return true;
 }
 
@@ -877,9 +1025,9 @@ void EPD_Painter2::_tick_task_body() {
       // If the frame overran the tick period, give lower-priority tasks air.
       if (us > (uint32_t)(1000000 / _config.tick_hz)) vTaskDelay(1);
     } else {   // nothing in flight
-      // Wake the rails if an anti-ghost sweep has come due on a sleeping
-      // screen — maintenance is the one thing allowed to power up unasked.
-      if (!_powered && _white_refresh_s && _dc && _next_refresh_us != 0 &&
+      // Wake the rails if deghost work is pending on a sleeping screen —
+      // maintenance is the one thing allowed to power up unasked.
+      if (!_powered && _white_refresh_s && _dc && _ghostAny &&
           esp_timer_get_time() >= _next_refresh_us) {
         powerOn();
       }

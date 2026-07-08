@@ -1,20 +1,22 @@
-// EPD_Painter2 — ghost lab: anti-ghost white refresh + DC trim engine.
+// EPD_Painter2 — ghost lab: pre-charged scrub deghosting + DC trim engine.
 //
 // The sequence:
 //   1. Heavy black content is drawn and left to sit (ghost seasoning).
+//      Every draw dirties its 50px grid cell + neighbours for 5 scrubs.
 //   2. The screen is cleared to white — look closely: faint ghosts of the
 //      old content survive on most panels.
-//   3. Every REFRESH_S seconds of idle, the maintenance engine sweeps the
-//      settled whites with short lighten pulses. Watch the ghosts fade a
-//      little with each sweep — and note the panel powers itself up for the
-//      sweep and back down after.
+//   3. Deghost passes run every REFRESH_S seconds of idle. Each white pixel
+//      in a dirty cell (random half per pass) first BANKS charge as short
+//      sub-threshold dark pulses, then — once its account holds one tick's
+//      worth — spends it as a single long light SCRUB pulse. Zero net DC
+//      per cycle, and every cycle ends hard against the white rail. Watch
+//      the ghosts dissolve over ~5 scrubs, then everything goes quiet and
+//      the panel powers itself down for good.
 //
-// Underneath, every maintenance pulse is booked in a per-pixel charge
-// account (ms of field, + = dark), and the trim engine fires short opposing
-// pulses at rail-parked pixels to pull accounts back toward zero — charge
-// without visible ink motion. Serial reports the totals:
-//   maint=N    lifetime maintenance pulses
-//   dcPeak=Nms worst per-pixel charge imbalance seen in the last sweep band
+// Serial:
+//   maint=N     lifetime maintenance pulses
+//   dcPeak=Nms  worst per-pixel charge account in the last sweep band
+//   ghost=N     dirty 50px cells still awaiting scrubs (watch it hit 0)
 
 // Choose your board (or leave both commented for auto-detect).
 //#define EPD_PAINTER2_PRESET_M5PAPER_S3
@@ -25,7 +27,7 @@
 
 EPD_Painter2 epd(EPD_PAINTER2_PRESET);
 
-static const uint16_t REFRESH_S = 15;
+static const uint16_t REFRESH_S = 1;   // spacing between deghost passes
 
 static const uint8_t kGreys[16] =
   { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 26 };
@@ -68,9 +70,9 @@ void loop() {
   if (millis() - lastStats > 2000) {
     lastStats = millis();
     auto s = epd.getStats();
-    Serial.printf("maint=%lu dcPeak=%dms powered=%d\n",
+    Serial.printf("maint=%lu dcPeak=%dms ghost=%u powered=%d\n",
                   (unsigned long)s.maintPulses, (int)s.dcPeakMs,
-                  (int)s.powered);
+                  s.ghostCells, (int)s.powered);
   }
   delay(100);
 }

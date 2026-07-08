@@ -173,6 +173,8 @@ void setup() {
   epd.setPulseWindow(7000);
   epd.setGreyPositions(kGreys);
   epd.setTravelBoost(7);   // one full 20ms pulse ≈ 7 fine positions
+  epd.setWhiteRefresh(1);  // live deghosting: scrub the trails the balls
+                           // and dead bricks leave, underneath the game
 
   screenW = epd.width();
   screenH = epd.height();

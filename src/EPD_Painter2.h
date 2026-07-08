@@ -122,6 +122,7 @@ public:
       uint16_t pausedRows;    // rows deferred by the compute budget, last frame
       uint32_t maintPulses;   // lifetime anti-ghost/DC-trim pulses fired
       int16_t  dcPeakMs;      // worst |charge account| seen in the last sweep band
+      uint16_t ghostCells;    // 50px cells still awaiting deghost scrubs
       bool     powered;       // panel rails currently on
   };
 
@@ -227,9 +228,20 @@ public:
   // Mid-grey pixels wait for their next rail visit. Net: per-pixel lifetime
   // DC is BOUNDED, not drifting.
   //
-  // setWhiteRefresh(s): every s seconds (screen idle), settled white pixels
-  // also receive one short lighten pulse — proactive ghost erasure. The bias
-  // it creates is booked, and the trim engine re-centres it. 0 = off.
+  // Anti-ghosting (Tony's pre-charged scrub, zero net DC by construction):
+  // the screen is divided into 50px cells; any draw dirties its cell and the
+  // 8 neighbours (ghost halos fringe outward) for GHOST_SCRUBS treatments.
+  // During idle passes, each white pixel in a dirty cell (randomly batched
+  // per pass so treatment scatters, never marches in blocks) first BANKS
+  // charge as short (~5ms) sub-threshold dark pulses — one per pass, spread
+  // over seconds, too brief and too rail-pinned to move ink — and once its
+  // account holds one full pulse's worth, SPENDS it as a single long
+  // (one-tick, ~20ms) light pulse: the actual ghost scrub. Each cycle nets
+  // ~zero charge, and it always ends hard against the white rail, so even
+  // sub-threshold creep is self-healed. A cell is clean after 5 scrubs.
+  //
+  // setWhiteRefresh(s): spacing between deghost passes (a pass = one sweep
+  // of the panel; a full precharge+scrub cycle is ~5 passes). 0 = off.
   void setWhiteRefresh(uint16_t seconds) { _white_refresh_s = seconds; }
 
   // ---- Frame sync (the e-paper waitVBL) -------------------------------------
@@ -285,15 +297,41 @@ private:
   void* _frame_cb_arg = nullptr;
 
   // ---- DC / maintenance state ----
+  static constexpr int GHOST_CELL   = 50;  // px per deghost grid cell
+  static constexpr int GHOST_SCRUBS = 5;   // scrubs before a cell is clean
+  static constexpr int GRID_MAX     = 21;  // ceil(1024 / GHOST_CELL)
+  static constexpr int MAINT_BAND   = 32;  // rows scanned per idle tick
   int16_t* _dc = nullptr;          // per-pixel charge account, ms (+ = dark)
+  uint8_t* _sustain = nullptr;     // chase-scan rows: scrub pulses ride on
   int16_t  _coarseCorrMs = 0;      // per-coarse-fire booking, set each frame
-  uint16_t _white_refresh_s = 0;   // anti-ghost sweep interval, 0 = off
+  uint16_t _white_refresh_s = 0;   // spacing between deghost passes, 0 = off
   int64_t  _next_refresh_us = 0;
-  int      _refreshRow = -1;       // active refresh sweep row, -1 = none
+  int      _refreshRow = -1;       // active deghost pass row, -1 = none
   int      _maintRow = 0;          // trim scan cursor
+  uint32_t _maintSalt = 1;         // per-pass lottery salt
+  uint8_t  _ghostGrid[GRID_MAX][GRID_MAX] = {};  // scrubs remaining per cell
+  uint32_t _cellScrubbed[GRID_MAX] = {};         // cells scrubbed this pass
+  int      _gridW = 0, _gridH = 0;
+  volatile bool _ghostAny = false;
   std::atomic<uint32_t> _st_maintPulses{0};
   std::atomic<int16_t>  _st_dcPeak{0};
-  bool maintenanceTick();          // idle-time trim + refresh; true if fired
+  bool maintenanceTick();          // idle-time deghost + trim; true if fired
+  void mergeMaintenance(bool coarse, int16_t shortMs, int16_t longMs);
+  void finishGhostPass();          // decrement scrubbed cells, re-arm pacing
+
+  // Ink activity dirties its 50px cell + neighbours for deghosting.
+  void markGhostCells(int y, int x0, int x1) {
+    const int gy0 = y / GHOST_CELL;
+    const int gx0 = x0 / GHOST_CELL, gx1 = (x1 - 1) / GHOST_CELL;
+    for (int gy = gy0 - 1; gy <= gy0 + 1; gy++) {
+      if (gy < 0 || gy >= _gridH) continue;
+      for (int gx = gx0 - 1; gx <= gx1 + 1; gx++) {
+        if (gx < 0 || gx >= _gridW) continue;
+        _ghostGrid[gy][gx] = GHOST_SCRUBS;
+      }
+    }
+    _ghostAny = true;
+  }
   bool _rested      = false;   // pulse ≥ tick: rest ticks replace neutral pass
   bool _offBeat     = false;   // frame parity: fine pulses fire on-beat only
   bool _fineHold    = false;   // this frame, fine pixels hold (rest beat)
@@ -361,6 +399,7 @@ private:
       for (int c = x0 / CHUNK_PX; c <= (x1 - 1) / CHUNK_PX; c++) bits |= (1u << c);
       _chunkMask[y].fetch_or(bits, std::memory_order_relaxed);
       _rowMask[y >> 5].fetch_or(1u << (y & 31), std::memory_order_relaxed);
+      markGhostCells(y, x0, x1);
   }
   bool anyActive() const;
 
