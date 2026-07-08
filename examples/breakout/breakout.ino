@@ -23,8 +23,8 @@
 EPD_Painter2 epd(EPD_PAINTER2_PRESET);
 
 // --- Game constants ---
-#define BALL_SIZE    24
-#define BALL_SPEED    2.5f   // px per 10ms tick (~250 px/s, 100 steps/s)
+#define BALL_SIZE    32
+#define BALL_SPEED   12.0f   // px per 20ms tick (~600 px/s, 50 steps/s)
 #define NUM_BALLS     3
 
 #define BRICK_COLS    8
@@ -160,20 +160,19 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 4000) delay(10);
 
-  epd.setTickRate(100);   // before begin()
   if (!epd.begin()) {
     Serial.println("EPD_Painter2 init failed!");
     while (1) delay(1000);
   }
 
-  // 16-grey calibration + dynamic pulse width at 100Hz (see bouncing_box):
-  // ball travel rides full 10ms ticks, brick shades land on 7ms on-beat
-  // pulses with the measured LUT.
+  // 16-grey calibration + dynamic pulse width at 50Hz: ball travel rides
+  // full 20ms coarse pulses, brick shades land on 7ms fine pulses with the
+  // measured LUT.
   static const uint8_t kGreys[16] =
     { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 26 };
   epd.setPulseWindow(7000);
   epd.setGreyPositions(kGreys);
-  epd.setTravelBoost(6);
+  epd.setTravelBoost(7);   // one full 20ms pulse ≈ 7 fine positions
 
   screenW = epd.width();
   screenH = epd.height();
@@ -207,5 +206,5 @@ void loop() {
                   (unsigned long)s.lastTickUs, (unsigned long)s.maxTickUs, s.activeRows);
   }
 
-  delay(10);   // one game step per simulation tick (100Hz)
+  delay(20);   // one game step per simulation tick (50Hz)
 }
