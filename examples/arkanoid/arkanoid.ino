@@ -23,6 +23,13 @@
 #include <Arduino.h>
 #include "EPD_Painter2_Adafruit.h"
 #include "usb_mouse.h"
+#include "touch_pad.h"
+
+// The M5PaperS3 doesn't source VBUS, so a bare OTG adapter won't power a
+// mouse (a POWERED OTG hub will). Happily the built-in GT911 touch panel
+// is the better paddle anyway: slide a finger anywhere, tap to serve.
+// Set to 1 if touch X runs opposite to the paddle.
+#define TOUCH_FLIP_X 0
 
 EPD_Painter2Adafruit gfx(EPD_PAINTER2_PRESET);
 
@@ -204,12 +211,28 @@ static void stepBall(Ball &b) {
 void loop() {
   gfx.waitFrame();                 // waitVBL(): draw in the blank, 50Hz lock
 
-  // --- input ---
+  // --- input: touch is absolute and wins; mouse deltas as a bonus ---
+  int tx, ty;
+  const bool touching =
+    touchRead(gfx.driver().getConfig().i2c.wire, tx, ty);
+  static bool wasTouching = false;
+  const bool tap = touching && !wasTouching;
+  wasTouching = touching;
+
   const int32_t dx = usbMouseTakeDX();
   const uint8_t btn = usbMouseButtons();
-  const bool click = (btn & 1) && !(prevBtn & 1);
+  const bool click = ((btn & 1) && !(prevBtn & 1)) || tap;
   prevBtn = btn;
-  padX += dx * 1.6f;
+
+  if (touching) {
+#if TOUCH_FLIP_X
+    padX = (W - 1 - tx) - padW / 2.0f;
+#else
+    padX = tx - padW / 2.0f;
+#endif
+  } else {
+    padX += dx * 1.6f;
+  }
   if (padX < 0) padX = 0;
   if (padX + padW > W) padX = W - padW;
 
