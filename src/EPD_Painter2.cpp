@@ -565,6 +565,7 @@ bool EPD_Painter2::tickFrame() {
   xSemaphoreGive(_draw_mtx);
 
   // ---- Phase 2: gapless scan-out ----
+  const int64_t scanStart = esp_timer_get_time();
   for (int row = 0; row < H; row++) {
     if (_frameActive[row >> 5] & (1u << (row & 31))) {
       memcpy(dma_buffer, _staging + (size_t)row * packed_row_bytes, packed_row_bytes);
@@ -572,6 +573,21 @@ bool EPD_Painter2::tickFrame() {
       memset(dma_buffer, 0x00, packed_row_bytes);
     }
     sendRow(row == 0, row == H - 1);
+  }
+
+  // ---- Phase 3 (optional): field-off pass ----
+  // The drive scan above only STARTS each pixel's dose — the pixel cap holds
+  // the drive voltage after its row is deselected. A second all-neutral scan
+  // writes 0V back onto every cap, ending the field ~_pulse_window_us after
+  // the drive scan began (per-row gap = one pass duration + wait, uniform
+  // across rows since both passes run at the same pace). Without it the
+  // field stays on until next tick's scan: pulse width == tick period.
+  if (_pulse_window_us && activeRows) {
+    while ((esp_timer_get_time() - scanStart) < (int64_t)_pulse_window_us) {}
+    for (int row = 0; row < H; row++) {
+      memset(dma_buffer, 0x00, packed_row_bytes);
+      sendRow(row == 0, row == H - 1);
+    }
   }
 
   _st_activeRows.store((uint16_t)activeRows, std::memory_order_relaxed);

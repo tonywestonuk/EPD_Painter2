@@ -167,6 +167,17 @@ public:
   // Calibration lever for the trajectory table; not needed in normal use.
   void setPulseDwell(uint8_t us) { _dwell_us = us; }
 
+  // Pulse width (µs) — the fine-dose lever. A pixel's field is not on only
+  // while its row is selected: the pixel cap holds the drive voltage until
+  // that row is next rewritten. By default that is next tick's scan, so one
+  // pulse = one full tick period (~20ms at 50Hz) of field time. With a window
+  // set, every drive scan is chased by an all-neutral scan that writes 0V
+  // back onto the caps, ending the field after ~window µs (measured from
+  // drive-scan start to neutral-scan start; floor = one scan duration,
+  // ~4-6ms). Smaller window = smaller grey step per pulse, at the cost of a
+  // second scan per tick. 0 = off (full-tick pulses, coarse fast travel).
+  void setPulseWindow(uint32_t us) { _pulse_window_us = us; }
+
   // Block until every pixel has arrived at its target (optional).
   void waitSettled(uint32_t timeout_ms = 5000);
 
@@ -188,6 +199,7 @@ private:
   int packed_row_bytes = 0;         // width / 4 (2 bits per pixel drive data)
   int dma_row_bytes    = 0;         // packed_row_bytes + row_pad_bytes
   volatile uint8_t _dwell_us = 0;   // extra per-row select time (dose control)
+  volatile uint32_t _pulse_window_us = 0;   // 0 = field stays on for full tick
 
   static constexpr int MAX_ROWS = 1024;
   static constexpr int CHUNK_PX = 64;          // dirty-tracking granularity
