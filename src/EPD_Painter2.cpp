@@ -583,6 +583,13 @@ bool EPD_Painter2::tickFrame() {
   // across rows since both passes run at the same pace). Without it the
   // field stays on until next tick's scan: pulse width == tick period.
   if (_pulse_window_us && activeRows) {
+    // Hybrid wait: hand the coarse milliseconds back to the scheduler, then
+    // spin the last ~2ms for microsecond dose precision. A late wakeup only
+    // lengthens the field uniformly (no row is selected while we wait), but
+    // dose wobble is grey wobble — hence the guard band before the spin.
+    const int64_t remain =
+        (int64_t)_pulse_window_us - (esp_timer_get_time() - scanStart);
+    if (remain > 2000) vTaskDelay(pdMS_TO_TICKS((uint32_t)(remain - 2000) / 1000));
     while ((esp_timer_get_time() - scanStart) < (int64_t)_pulse_window_us) {}
     for (int row = 0; row < H; row++) {
       memset(dma_buffer, 0x00, packed_row_bytes);
