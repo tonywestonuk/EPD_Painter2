@@ -249,6 +249,7 @@ bool EPD_Painter2::begin() {
 #ifdef EPD_PAINTER2_PRESET_AUTO
   if (!autoDetectBoard()) return false;
 #endif
+  if (_tick_override) _config.tick_hz = _tick_override;
 
 #ifdef ARDUINO
   if (_config.i2c.scl != -1 && _config.i2c.wire == nullptr) {
@@ -443,6 +444,14 @@ void EPD_Painter2::touchRows(int y0, int y1) {
   for (int y = y0; y <= y1; y++) markSpan(y, 0, _config.width);
 }
 
+void EPD_Painter2::touchSpan(int y, int x0, int x1) {
+  if (y < 0 || y >= _config.height) return;
+  if (x0 < 0) x0 = 0;
+  if (x1 > _config.width) x1 = _config.width;
+  if (x0 >= x1) return;
+  markSpan(y, x0, x1);
+}
+
 void EPD_Painter2::waitSettled(uint32_t timeout_ms) {
   uint32_t start = (uint32_t)(esp_timer_get_time() / 1000);
   while (anyActive()) {
@@ -482,9 +491,11 @@ EPD_Painter2::Stats EPD_Painter2::getStats() {
 // Returns true if any pixel in the row is still in flight afterwards.
 // out must already contain neutral (zero) drive data for clean chunks.
 // =============================================================================
-bool EPD_Painter2::rowKernel(int row, uint8_t* out) {
+bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
   const uint8_t* rowTgt = _target + (size_t)row * _config.width;
   uint8_t*       rowCur = _state  + (size_t)row * _config.width;
+  const uint8_t gain    = _travel_gain;
+  const bool boosted    = (gain > 1) && (_pulse_window_us > 0);
 
   uint16_t chunks = _chunkMask[row].load(std::memory_order_relaxed);
   uint16_t settled = 0;
@@ -502,9 +513,41 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out) {
       for (int i = 0; i < 4; i++) {
         const uint8_t cv = cur[i];
         const uint8_t tv = _posLUT[tgt[i] & 0x0F];   // grey → pulse position
-        uint8_t d = 0;
-        if (cv < tv)      { d = DRIVE_DARK;  cur[i] = cv + 1; chunkActive = true; }
-        else if (cv > tv) { d = DRIVE_LIGHT; cur[i] = cv - 1; chunkActive = true; }
+        const uint8_t delta = (cv > tv) ? (uint8_t)(cv - tv) : (uint8_t)(tv - cv);
+        uint8_t d = 0, nv = cv;
+        // How far does this pixel move this tick?
+        //  - windowed mode: the global step (1, or gain on coarse frames);
+        //    pixels that can't take the whole step sit out (0b00 = hold)
+        //    and land on a later fine frame.
+        //  - rested mode: per-pixel — travel pixels (≥ gain to go) keep the
+        //    field on every tick; landing pixels fire on-beat and take the
+        //    off-beat tick as the rest the ink's inertia needs.
+        uint8_t s = 0;
+        if (delta) {
+          if (_rested) {
+            const bool travel = boosted && delta >= gain;
+            s = travel ? gain : (_fineHold ? 0 : 1);
+          } else if (delta >= step && (step > 1 || !_fineHold)) {
+            // step>1 = coarse frame: travel pixels fire, others sat out by
+            // the delta guard. step==1: fine frame unless this is a rest
+            // beat (_fineHold), where everyone holds and the plain scan
+            // just terminates the previous frame's pulses.
+            s = step;
+          }
+        }
+        if (s) {
+          if (cv < tv) { d = DRIVE_DARK;  nv = cv + s; }
+          else         { d = DRIVE_LIGHT; nv = cv - s; }
+          cur[i] = nv;
+          _anyDrive = true;
+        }
+        if (nv != tv) {
+          chunkActive = true;
+          if (!_rested) {   // classify remaining work → frame scheduling
+            const uint8_t rem = (nv > tv) ? (uint8_t)(nv - tv) : (uint8_t)(tv - nv);
+            if (boosted && rem >= gain) _needCoarse = true; else _needFine = true;
+          }
+        }
         o = (o << 2) | d;
       }
       o8[b] = o;
@@ -544,17 +587,59 @@ bool EPD_Painter2::tickFrame() {
   bool anyLeft = false;
   int activeRows = 0;
 
+  // Frame scheduling. The beat (_offBeat) alternates every frame. A fine
+  // pulse's dose is only calibrated WITH its rest (~13ms of field-off after
+  // it — ink inertia resets); when ticks come too fast to provide that rest
+  // between consecutive frames, fine pixels fire on-beat only. At 50Hz every
+  // frame has the rest built in; at 100Hz fine pixels fire every other
+  // frame — the identical 7ms-on/13ms-off pulse train, so one calibration
+  // serves both tick rates. Coarse (full-tick) travel takes the off beats.
+  const uint32_t tickUs = 1000000UL / _config.tick_hz;
+  const bool hadCoarse = _needCoarse, hadFine = _needFine;
+  _needCoarse = _needFine = false;
+  _rested  = _pulse_window_us >= tickUs;   // pulse = whole tick; rest = next
+  _offBeat = !_offBeat;
+  const bool boostOn  = (_travel_gain > 1) && (_pulse_window_us > 0);
+  const bool needRest = !_rested && _pulse_window_us &&
+                        (tickUs < _pulse_window_us + 10000);
+  bool coarse, fineGo;
+  if (_rested) {          // per-pixel in the kernel: travel rides every tick
+    coarse = false;       fineGo = !_offBeat;
+  } else if (needRest) {  // fast windowed ticks: fine on-beat, coarse off-beat
+    fineGo = !_offBeat && (hadFine || !hadCoarse);
+    coarse = boostOn && hadCoarse && !fineGo;
+  } else {                // slow windowed ticks (50Hz): alternate on demand
+    coarse = boostOn && hadCoarse && (!hadFine || !_lastCoarse);
+    fineGo = !coarse;
+  }
+  _lastCoarse = coarse;
+  _fineHold   = !fineGo;
+  _anyDrive   = false;
+  const uint8_t step = coarse ? _travel_gain : 1;
+
   // ---- Phase 1: simulate + stage ----
   memset(_frameActive, 0, sizeof(_frameActive));
+  const int64_t p1Start = esp_timer_get_time();
+  const uint32_t budget = _compute_budget_us;
   xSemaphoreTake(_draw_mtx, portMAX_DELAY);
-  for (int row = 0; row < H; row++) {
+  for (int k = 0; k < H; k++) {
+    const int row = (_rowCursor + k) % H;   // rotating start: paused rows go first
     const uint32_t bit = 1u << (row & 31);
     if (!(_rowMask[row >> 5].load(std::memory_order_relaxed) & bit)) continue;
+
+    if (budget && (uint32_t)(esp_timer_get_time() - p1Start) > budget) {
+      // Budget exhausted: the remaining active rows pause this tick — they
+      // stage nothing, the scan writes them neutral (field off, ink and
+      // ledger hold), and the cursor makes them first in line next tick.
+      _rowCursor = (uint16_t)row;
+      anyLeft = true;
+      break;
+    }
 
     activeRows++;
     uint8_t* stage = _staging + (size_t)row * packed_row_bytes;
     memset(stage, 0x00, packed_row_bytes);   // neutral base; kernel fills dirty chunks
-    const bool still = rowKernel(row, stage);
+    const bool still = rowKernel(row, stage, step);
     _frameActive[row >> 5] |= bit;
     if (!still) {
       _rowMask[row >> 5].fetch_and(~bit, std::memory_order_relaxed);
@@ -582,7 +667,9 @@ bool EPD_Painter2::tickFrame() {
   // the drive scan began (per-row gap = one pass duration + wait, uniform
   // across rows since both passes run at the same pace). Without it the
   // field stays on until next tick's scan: pulse width == tick period.
-  if (_pulse_window_us && activeRows) {
+  // Coarse frames skip it on purpose — full-tick pulses ARE the boost; their
+  // field is ended by the next tick's scan, or by the idle flush frame.
+  if (_pulse_window_us && activeRows && !coarse && !_rested && _anyDrive) {
     // Hybrid wait: hand the coarse milliseconds back to the scheduler, then
     // spin the last ~2ms for microsecond dose precision. A late wakeup only
     // lengthens the field uniformly (no row is selected while we wait), but
@@ -591,14 +678,28 @@ bool EPD_Painter2::tickFrame() {
         (int64_t)_pulse_window_us - (esp_timer_get_time() - scanStart);
     if (remain > 2000) vTaskDelay(pdMS_TO_TICKS((uint32_t)(remain - 2000) / 1000));
     while ((esp_timer_get_time() - scanStart) < (int64_t)_pulse_window_us) {}
-    for (int row = 0; row < H; row++) {
-      memset(dma_buffer, 0x00, packed_row_bytes);
-      sendRow(row == 0, row == H - 1);
-    }
+    neutralFrame();
+    _flushPending = false;
+  } else if (activeRows) {
+    // Coarse/rested frames leave full-tick pulses in flight — if the screen
+    // settles before another scan runs, the idle flush frame terminates
+    // them. A frame that drove nothing (rest beat) already terminated all
+    // prior pulses with its all-neutral scan.
+    _flushPending = _anyDrive;
   }
 
   _st_activeRows.store((uint16_t)activeRows, std::memory_order_relaxed);
   return anyLeft;
+}
+
+// Scan one full frame of neutral (0V) onto every pixel cap, ending any field
+// left by a previous drive scan. Gapless, like every scan.
+void EPD_Painter2::neutralFrame() {
+  const int H = _config.height;
+  for (int row = 0; row < H; row++) {
+    memset(dma_buffer, 0x00, packed_row_bytes);
+    sendRow(row == 0, row == H - 1);
+  }
 }
 
 // =============================================================================
@@ -633,6 +734,13 @@ void EPD_Painter2::_tick_task_body() {
       // If the frame overran the tick period, give lower-priority tasks air.
       if (us > (uint32_t)(1000000 / _config.tick_hz)) vTaskDelay(1);
     } else if (_powered) {
+      if (_flushPending) {
+        // Terminate the final full-tick pulses of the transition: with no
+        // further scans coming, the caps would otherwise hold the last drive
+        // voltage until power-off — overdosing every transition's last pulse.
+        neutralFrame();
+        _flushPending = false;
+      }
       if (++_idle_ticks >= idleOffTicks) powerOff();
     }
   }

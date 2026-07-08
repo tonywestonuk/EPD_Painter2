@@ -32,12 +32,24 @@ void setup() {
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 4000) delay(10);
 
+  epd.setTickRate(100);   // before begin()
   if (!epd.begin()) {
     Serial.println("EPD_Painter2 init failed!");
     while (1) delay(1000);
   }
   Serial.printf("EPD_Painter2 %dx%d, tick %dHz\n",
                 epd.width(), epd.height(), epd.getConfig().tick_hz);
+
+  // 16-grey calibration (measured — see sixteen_greys) + dynamic pulse
+  // width, now at 100Hz: fine pixels fire on-beat every other tick — the
+  // identical 7ms-on/13ms-off pulse train as 50Hz, so the same LUT holds —
+  // while the box's black/white travel rides full 10ms ticks in between.
+  // Commands land every 10ms: 100 updates/second.
+  static const uint8_t kGreys[16] =
+    { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 26 };
+  epd.setPulseWindow(7000);
+  epd.setGreyPositions(kGreys);
+  epd.setTravelBoost(6);   // one gapped 10ms pulse ≈ 6 fine positions (measured)
 
   // 16-level grey staircase across the top, drawn once.
   const int bandW = epd.width() / 16;
@@ -77,5 +89,5 @@ void loop() {
                   (unsigned long)s.maxTickUs, s.activeRows, (int)s.powered);
   }
 
-  delay(20);   // pace the animation to the 50Hz simulation tick
+  delay(10);   // pace the animation to the 100Hz simulation tick
 }

@@ -149,6 +149,9 @@ public:
   // Call touchRows(y0,y1) after writing directly so the tick task notices.
   uint8_t* targetBuffer() { return _target; }
   void touchRows(int y0, int y1);
+  // Finer-grained: mark just [x0,x1) of row y (dirty tracking is 64px
+  // chunks, so precise spans keep the tick kernel off unchanged PSRAM).
+  void touchSpan(int y, int x0, int x1);
 
   // ---- Grey calibration -----------------------------------------------------
   // Maps user grey (0=white … 15=black) to a pulse position on the ink's
@@ -178,6 +181,37 @@ public:
   // second scan per tick. 0 = off (full-tick pulses, coarse fast travel).
   void setPulseWindow(uint32_t us) { _pulse_window_us = us; }
 
+  // Dynamic pulse width ("travel boost") — requires a pulse window. One
+  // full-tick pulse (~20ms of field) moves the ink roughly as far as GAIN
+  // short-window pulses (measured ≈7 at a 7ms window: short pulses end
+  // before the ink overcomes its starting inertia, so the ratio beats the
+  // raw 20/7 timing). With boost on, a pixel with ≥ gain positions left to
+  // travel takes coarse full-tick pulses (booked as ±gain in the ledger)
+  // and switches to fine pulses for the landing; pixels that only need fine
+  // steps sit out coarse ticks (0b00 = hold). Tick type is global per
+  // frame: all-travel → coarse, all-landing → fine, mixed → alternate, so
+  // landings are never starved by a running animation. 0 or 1 = off.
+  // Calibrate gain so a staircase drawn with boost matches one without.
+  void setTravelBoost(uint8_t gain) { _travel_gain = gain; }
+
+  // Tick rate override (Hz), applied at begin() — call before it. Default
+  // is the preset's 50. At 100Hz, set the pulse window EQUAL to the tick
+  // period (10000): the driver switches to "rested" pulses — a fine pulse
+  // is one whole drive tick ended by the NEXT tick's scan writing 0b00, and
+  // the pixel rests the following tick (ink inertia needs the gap between
+  // fine pulses). No field-off pass runs, so one scan per tick and the
+  // 10ms budget holds. Travel pixels (boost) keep the field on across
+  // consecutive ticks instead of taking rests.
+  void setTickRate(uint16_t hz) { _tick_override = hz; }
+
+  // Compute budget (µs) for the tick's simulate phase. 0 = unlimited. When
+  // a full-screen storm of changes exceeds the budget, the remaining active
+  // rows PAUSE for that tick — they stage nothing, the scan writes them
+  // neutral, ink and ledger hold — and a rotating cursor puts them first
+  // next tick. Caps tick time (and draw-mutex latency) at ~budget + one
+  // scan; heavy scenes trade a little extra motion blur for a steady rate.
+  void setComputeBudget(uint32_t us) { _compute_budget_us = us; }
+
   // Block until every pixel has arrived at its target (optional).
   void waitSettled(uint32_t timeout_ms = 5000);
 
@@ -200,6 +234,18 @@ private:
   int dma_row_bytes    = 0;         // packed_row_bytes + row_pad_bytes
   volatile uint8_t _dwell_us = 0;   // extra per-row select time (dose control)
   volatile uint32_t _pulse_window_us = 0;   // 0 = field stays on for full tick
+  volatile uint8_t _travel_gain = 0;   // coarse pulse worth, in fine positions
+  volatile uint32_t _compute_budget_us = 0;  // phase-1 cap; 0 = unlimited
+  uint16_t _rowCursor = 0;     // rotating start row for budgeted phase 1
+  uint16_t _tick_override = 0; // setTickRate(); applied in begin()
+  bool _rested      = false;   // pulse ≥ tick: rest ticks replace neutral pass
+  bool _offBeat     = false;   // frame parity: fine pulses fire on-beat only
+  bool _fineHold    = false;   // this frame, fine pixels hold (rest beat)
+  bool _lastCoarse  = false;   // previous frame was a coarse frame
+  bool _anyDrive    = false;   // this frame staged at least one drive pulse
+  bool _needCoarse  = false;   // set by rowKernel: travel work remains
+  bool _needFine    = false;   // set by rowKernel: landing work remains
+  bool _flushPending = false;  // a full-tick pulse needs its terminating scan
 
   static constexpr int MAX_ROWS = 1024;
   static constexpr int CHUNK_PX = 64;          // dirty-tracking granularity
@@ -250,7 +296,8 @@ private:
   void sendRow(bool firstLine, bool lastLine = false);
   void hardClear();                     // establish all-white baseline
   bool tickFrame();                     // one simulation frame; true if any pixel still active
-  bool rowKernel(int row, uint8_t* out);// advance one row; true if still active
+  bool rowKernel(int row, uint8_t* out, uint8_t step); // advance one row; true if still active
+  void neutralFrame();                  // scan 0V onto every pixel cap (field off)
   // Mark pixel columns [x0, x1) of row y as dirty (chunk-granular).
   void markSpan(int y, int x0, int x1) {
       uint16_t bits = 0;
