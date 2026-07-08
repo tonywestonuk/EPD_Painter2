@@ -85,6 +85,7 @@ public:
     void setTravelBoost(uint8_t gain)  { _epd.setTravelBoost(gain); }
     void setTickRate(uint16_t hz)      { _epd.setTickRate(hz); }        // before begin()
     void setComputeBudget(uint32_t us) { _epd.setComputeBudget(us); }
+    void setWhiteRefresh(uint16_t s)   { _epd.setWhiteRefresh(s); }
     void waitSettled(uint32_t timeout_ms = 5000) { _epd.waitSettled(timeout_ms); }
     bool waitFrame(uint32_t timeout_ms = 100) { return _epd.waitFrame(timeout_ms); }
     void onFrame(EPD_Painter2::FrameCallback cb, void* arg = nullptr) { _epd.onFrame(cb, arg); }

@@ -120,6 +120,8 @@ public:
       uint32_t maxTickUs;     // worst frame since reset
       uint16_t activeRows;    // rows with in-flight pixels, last frame
       uint16_t pausedRows;    // rows deferred by the compute budget, last frame
+      uint32_t maintPulses;   // lifetime anti-ghost/DC-trim pulses fired
+      int16_t  dcPeakMs;      // worst |charge account| seen in the last sweep band
       bool     powered;       // panel rails currently on
   };
 
@@ -213,6 +215,23 @@ public:
   // scan; heavy scenes trade a little extra motion blur for a steady rate.
   void setComputeBudget(uint32_t us) { _compute_budget_us = us; }
 
+  // ---- DC balance & anti-ghost maintenance ----------------------------------
+  // Every pixel carries a charge account (int16, ms of field, + toward dark).
+  // Fine pulses book NOTHING — their charge matches the position ledger,
+  // which cancels on round trips — so the account records only exceptions:
+  // coarse pulses' charge/optics gap, white-refresh pulses, and trim pulses.
+  // While the screen is otherwise idle, a maintenance sweep fires SHORT
+  // (~one scan, ~5ms) opposing pulses at pixels parked on a rail to pull
+  // their account back toward zero: below the ink's inertia threshold and
+  // against the rail's stiction, charge moves but ink visibly does not.
+  // Mid-grey pixels wait for their next rail visit. Net: per-pixel lifetime
+  // DC is BOUNDED, not drifting.
+  //
+  // setWhiteRefresh(s): every s seconds (screen idle), settled white pixels
+  // also receive one short lighten pulse — proactive ghost erasure. The bias
+  // it creates is booked, and the trim engine re-centres it. 0 = off.
+  void setWhiteRefresh(uint16_t seconds) { _white_refresh_s = seconds; }
+
   // ---- Frame sync (the e-paper waitVBL) -------------------------------------
   // The tick's compute phase is the "raster read": it samples your targets
   // once per frame. The moment a frame ends is therefore the vertical blank —
@@ -264,6 +283,17 @@ private:
   SemaphoreHandle_t _vbl_sem = nullptr;          // given once per frame
   volatile FrameCallback _frame_cb = nullptr;    // user frame hook
   void* _frame_cb_arg = nullptr;
+
+  // ---- DC / maintenance state ----
+  int16_t* _dc = nullptr;          // per-pixel charge account, ms (+ = dark)
+  int16_t  _coarseCorrMs = 0;      // per-coarse-fire booking, set each frame
+  uint16_t _white_refresh_s = 0;   // anti-ghost sweep interval, 0 = off
+  int64_t  _next_refresh_us = 0;
+  int      _refreshRow = -1;       // active refresh sweep row, -1 = none
+  int      _maintRow = 0;          // trim scan cursor
+  std::atomic<uint32_t> _st_maintPulses{0};
+  std::atomic<int16_t>  _st_dcPeak{0};
+  bool maintenanceTick();          // idle-time trim + refresh; true if fired
   bool _rested      = false;   // pulse ≥ tick: rest ticks replace neutral pass
   bool _offBeat     = false;   // frame parity: fine pulses fire on-beat only
   bool _fineHold    = false;   // this frame, fine pixels hold (rest beat)

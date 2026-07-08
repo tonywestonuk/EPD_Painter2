@@ -279,6 +279,12 @@ bool EPD_Painter2::begin() {
   memset(_target, 0, npx);   // all white
   memset(_state,  0, npx);
 
+  // Per-pixel charge account for DC trim / anti-ghost (optional: driver
+  // works without it if PSRAM is tight — maintenance just stays off).
+  _dc = static_cast<int16_t *>(
+    heap_caps_aligned_alloc(16, npx * sizeof(int16_t), MALLOC_CAP_SPIRAM));
+  if (_dc) memset(_dc, 0, npx * sizeof(int16_t));
+
   // Frame staging — internal RAM preferred (fast phase-2 memcpys), PSRAM ok.
   const size_t staging_size = (size_t)packed_row_bytes * _config.height;
   _staging = static_cast<uint8_t *>(
@@ -481,6 +487,8 @@ EPD_Painter2::Stats EPD_Painter2::getStats() {
   s.maxTickUs  = _st_maxUs.load(std::memory_order_relaxed);
   s.activeRows = _st_activeRows.load(std::memory_order_relaxed);
   s.pausedRows = _st_pausedRows.load(std::memory_order_relaxed);
+  s.maintPulses = _st_maintPulses.load(std::memory_order_relaxed);
+  s.dcPeakMs   = _st_dcPeak.load(std::memory_order_relaxed);
   s.powered    = _powered;
   return s;
 }
@@ -503,6 +511,7 @@ EPD_Painter2::Stats EPD_Painter2::getStats() {
 bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
   const uint8_t* rowTgt = _target + (size_t)row * _config.width;
   uint8_t*       rowCur = _state  + (size_t)row * _config.width;
+  int16_t*       rowDc  = _dc ? _dc + (size_t)row * _config.width : nullptr;
   const uint8_t gain    = _travel_gain;
   const bool boosted    = (gain > 1) && (_pulse_window_us > 0);
 
@@ -549,6 +558,12 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
           else         { d = DRIVE_LIGHT; nv = cv - s; }
           cur[i] = nv;
           _anyDrive = true;
+          if (s > 1 && rowDc) {   // coarse: book the charge/optics gap
+            int16_t& a = rowDc[(size_t)(cur - rowCur) + i];
+            int32_t v = a + ((d == DRIVE_DARK) ? _coarseCorrMs : -_coarseCorrMs);
+            if (v > 32000) v = 32000; else if (v < -32000) v = -32000;
+            a = (int16_t)v;
+          }
         }
         if (nv != tv) {
           chunkActive = true;
@@ -626,6 +641,14 @@ bool EPD_Painter2::tickFrame() {
   _fineHold   = !fineGo;
   _anyDrive   = false;
   const uint8_t step = coarse ? _travel_gain : 1;
+
+  // Charge booking for coarse fires: actual field time (one tick) minus the
+  // fine-nominal the position ledger assumes (gain × window). Fine pulses
+  // book nothing — their charge matches the ledger exactly.
+  const int16_t tickMs = (int16_t)(tickUs / 1000);
+  const int16_t winMs  = _pulse_window_us ? (int16_t)(_pulse_window_us / 1000)
+                                          : tickMs;
+  _coarseCorrMs = coarse ? (int16_t)(tickMs - (int16_t)step * winMs) : 0;
 
   // ---- Phase 1: simulate + stage ----
   memset(_frameActive, 0, sizeof(_frameActive));
@@ -722,6 +745,107 @@ void EPD_Painter2::neutralFrame() {
 }
 
 // =============================================================================
+// maintenanceTick() — idle-time DC trim + anti-ghost white refresh.
+//
+// Runs only when nothing is in flight and the rails are up. Scans a band of
+// rows per tick; any pulses due are fired as one SHORT-pulse frame: a drive
+// scan chased immediately by the field-off scan, ~one scan time (~5ms) of
+// field. Short pulses at a rail are charge without (visible) motion — the
+// ink's first-pulse-from-rail stiction is the highest on the response curve
+// (measured: the first 7ms pulse from white moved reflectance ~0.01).
+//
+//   - refresh sweep (every _white_refresh_s): settled whites get one LIGHT
+//     pulse — proactive ghost erasure, booked as charge.
+//   - trim: any rail-parked pixel whose account exceeds ±TRIM_AT gets an
+//     opposing pulse; accounts head back to centre a few ms per idle tick.
+// Returns true if anything was fired (caller holds off the idle power-down).
+// =============================================================================
+bool EPD_Painter2::maintenanceTick() {
+  if (!_dc) return false;
+  const int H = _config.height, W = _config.width;
+  static constexpr int BAND = 32;          // rows scanned per idle tick
+  static constexpr int16_t TRIM_AT  = 15;  // ms of imbalance before trimming
+  static constexpr int16_t PULSE_MS = 5;   // ~one scan of field time
+
+  if (_white_refresh_s && _next_refresh_us == 0)
+    _next_refresh_us = esp_timer_get_time() + (int64_t)_white_refresh_s * 1000000LL;
+  if (_white_refresh_s && _refreshRow < 0 &&
+      esp_timer_get_time() >= _next_refresh_us)
+    _refreshRow = 0;
+
+  const bool refreshing = (_refreshRow >= 0);
+  const int r0 = refreshing ? _refreshRow : _maintRow;
+  const int nrows = refreshing ? ((H - r0) < BAND ? (H - r0) : BAND) : BAND;
+
+  bool bandFired[BAND] = {false};
+  uint32_t pulses = 0;
+  int16_t peak = 0;
+  const uint8_t blackPos = _posLUT[15];
+
+  xSemaphoreTake(_draw_mtx, portMAX_DELAY);
+  for (int n = 0; n < nrows; n++) {
+    const int row = (r0 + n) % H;
+    const uint8_t* st = _state  + (size_t)row * W;
+    const uint8_t* tg = _target + (size_t)row * W;
+    int16_t*       dc = _dc     + (size_t)row * W;
+    uint8_t*    stage = _staging + (size_t)row * packed_row_bytes;
+    bool rowFired = false;
+    for (int x = 0; x < W; x += 4) {
+      uint8_t o = 0;
+      for (int i = 0; i < 4; i++) {
+        const int xi = x + i;
+        const uint8_t sv = st[xi];
+        uint8_t d = 0;
+        if (sv == 0 || sv >= blackPos) {     // parked at a rail
+          int16_t a = dc[xi];
+          if (refreshing && sv == 0 && (tg[xi] & 0x0F) == 0) {
+            d = DRIVE_LIGHT; a -= PULSE_MS;  // anti-ghost, booked
+          } else if (a >= TRIM_AT) {
+            d = DRIVE_LIGHT; a -= PULSE_MS;  // excess dark charge
+          } else if (a <= -TRIM_AT) {
+            d = DRIVE_DARK;  a += PULSE_MS;  // excess light charge
+          }
+          if (d) { dc[xi] = a; pulses++; rowFired = true; }
+          const int16_t m = (a < 0) ? -a : a;
+          if (m > peak) peak = m;
+        }
+        o = (o << 2) | d;
+      }
+      stage[x >> 2] = o;
+    }
+    bandFired[n] = rowFired;
+  }
+  xSemaphoreGive(_draw_mtx);
+
+  if (refreshing) {
+    _refreshRow += nrows;
+    if (_refreshRow >= H) {
+      _refreshRow = -1;
+      _next_refresh_us = esp_timer_get_time() + (int64_t)_white_refresh_s * 1000000LL;
+    }
+  } else {
+    _maintRow = (_maintRow + nrows) % H;
+  }
+
+  _st_dcPeak.store(peak, std::memory_order_relaxed);
+  if (!pulses) return false;
+  _st_maintPulses.fetch_add(pulses, std::memory_order_relaxed);
+
+  // Short-pulse frame: drive scan, then the field-off scan straight after.
+  for (int row = 0; row < H; row++) {
+    int n = row - r0; if (n < 0) n += H;
+    if (n < nrows && bandFired[n]) {
+      memcpy(dma_buffer, _staging + (size_t)row * packed_row_bytes, packed_row_bytes);
+    } else {
+      memset(dma_buffer, 0x00, packed_row_bytes);
+    }
+    sendRow(row == 0, row == H - 1);
+  }
+  neutralFrame();
+  return true;
+}
+
+// =============================================================================
 // Tick task — fixed-rate simulation heartbeat.
 // =============================================================================
 void EPD_Painter2::_tick_task_entry(void *arg) {
@@ -752,15 +876,27 @@ void EPD_Painter2::_tick_task_body() {
 
       // If the frame overran the tick period, give lower-priority tasks air.
       if (us > (uint32_t)(1000000 / _config.tick_hz)) vTaskDelay(1);
-    } else if (_powered) {
-      if (_flushPending) {
-        // Terminate the final full-tick pulses of the transition: with no
-        // further scans coming, the caps would otherwise hold the last drive
-        // voltage until power-off — overdosing every transition's last pulse.
-        neutralFrame();
-        _flushPending = false;
+    } else {   // nothing in flight
+      // Wake the rails if an anti-ghost sweep has come due on a sleeping
+      // screen — maintenance is the one thing allowed to power up unasked.
+      if (!_powered && _white_refresh_s && _dc && _next_refresh_us != 0 &&
+          esp_timer_get_time() >= _next_refresh_us) {
+        powerOn();
       }
-      if (++_idle_ticks >= idleOffTicks) powerOff();
+      if (_powered) {
+        if (_flushPending) {
+          // Terminate the final full-tick pulses of the transition: with no
+          // further scans coming, the caps would otherwise hold the last
+          // drive voltage until power-off — overdosing the last pulse.
+          neutralFrame();
+          _flushPending = false;
+        }
+        if (maintenanceTick()) {
+          _idle_ticks = 0;               // stay powered while trimming
+        } else if (++_idle_ticks >= idleOffTicks) {
+          powerOff();
+        }
+      }
     }
 
     // Vertical blank: the frame (or idle heartbeat) is done; targets have
