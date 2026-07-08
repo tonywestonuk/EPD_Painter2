@@ -499,8 +499,6 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
   uint8_t*       rowCur = _state  + (size_t)row * _config.width;
   const uint8_t gain    = _travel_gain;
   const bool boosted    = (gain > 1) && (_pulse_window_us > 0);
-  const bool commit     = _rail_commit;
-  const uint8_t blackPos = _posLUT[15];
 
   uint16_t chunks = _chunkMask[row].load(std::memory_order_relaxed);
   uint16_t settled = 0;
@@ -516,15 +514,8 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
     for (int b = 0; b < CHUNK_PX / 4; b++) {
       uint8_t o = 0;
       for (int i = 0; i < 4; i++) {
-        const uint8_t raw = cur[i];
-        const uint8_t ftv = _posLUT[tgt[i] & 0x0F];  // fresh target position
-        uint8_t cv = raw, fl = 0, tv = ftv;
-        if (commit) {
-          cv = raw & 0x1F;
-          fl = raw & 0xC0;
-          if (fl & 0x80)          tv = (fl & 0x40) ? blackPos : 0;  // honor latch
-          else if (cv != ftv)     fl = 0x80 | (ftv > cv ? 0x40 : 0); // new journey
-        }
+        const uint8_t cv = cur[i];
+        const uint8_t tv = _posLUT[tgt[i] & 0x0F];   // grey → pulse position
         const uint8_t delta = (cv > tv) ? (uint8_t)(cv - tv) : (uint8_t)(tv - cv);
         uint8_t d = 0, nv = cv;
         // How far does this pixel move this tick?
@@ -550,15 +541,10 @@ bool EPD_Painter2::rowKernel(int row, uint8_t* out, uint8_t step) {
         if (s) {
           if (cv < tv) { d = DRIVE_DARK;  nv = cv + s; }
           else         { d = DRIVE_LIGHT; nv = cv - s; }
+          cur[i] = nv;
           _anyDrive = true;
         }
-        if (commit) {
-          if (nv == tv) fl = 0;   // arrived: unlatch, fresh target next tick
-          if ((nv | fl) != raw) cur[i] = nv | fl;
-        } else if (nv != cv) {
-          cur[i] = nv;
-        }
-        if (nv != tv || (commit && !fl && nv != ftv)) {
+        if (nv != tv) {
           chunkActive = true;
           if (!_rested) {   // classify remaining work → frame scheduling
             const uint8_t rem = (nv > tv) ? (uint8_t)(nv - tv) : (uint8_t)(tv - nv);

@@ -127,15 +127,7 @@ void setup() {
   epd.setPulseWindow(7000);
   epd.setGreyPositions(kGreys);
   epd.setTravelBoost(7);       // one full 20ms pulse ≈ 7 fine positions
-  // TONE CONTROL. The scalar kernel can't simulate a full-screen storm in
-  // one 20ms tick, so this budget picks where the compromise lands:
-  //   14000 — silky 50Hz ink cadence, but pixels rationed -> motion greys
-  //       0 — unlimited: pixels gorge, hard blacks, but storm ticks hit
-  //             100-200ms -> 5-10Hz flip-book judder
-  //   22000 — the middle: ~35Hz cadence in storms, most pixels serviced
-  //             every tick, mild dose stretch (rails absorb it)
-  // Tune to taste. The SIMD kernel will make this knob obsolete.
-  epd.setComputeBudget(22000);
+  epd.setComputeBudget(14000); // full-screen storms pause rows, not the clock
 
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if (!SD.begin(SD_CS, SPI, 40000000) && !SD.begin(SD_CS, SPI, 25000000)) {
@@ -152,10 +144,6 @@ void setup() {
     static const uint8_t kBW[16] =
       { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 21 };
     epd.setGreyPositions(kBW);
-    // Fast scenes retarget pixels mid-flight; the latch makes every journey
-    // finish at a rail (re-anchoring the ink) instead of U-turning — the
-    // cure for fast sections decaying into grey soup.
-    epd.setRailCommit(true);
     for (int v = 0; v < 256; v++)
       for (int bit = 0; bit < 8; bit++) {
         const uint8_t g = (v & (0x80 >> bit)) ? 15 : 0;
