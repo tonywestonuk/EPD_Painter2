@@ -213,6 +213,28 @@ public:
   // scan; heavy scenes trade a little extra motion blur for a steady rate.
   void setComputeBudget(uint32_t us) { _compute_budget_us = us; }
 
+  // ---- Frame sync (the e-paper waitVBL) -------------------------------------
+  // The tick's compute phase is the "raster read": it samples your targets
+  // once per frame. The moment a frame ends is therefore the vertical blank —
+  // anything drawn between then and the next frame is picked up whole, no
+  // beginUpdate() needed. Both hooks fire every tick period, INCLUDING idle
+  // ticks (a settled screen still has a heartbeat), at tick_hz.
+
+  // Block until the current frame completes. The classic game loop:
+  //   loop() { epd.waitFrame(); step_game(); draw(); }
+  // steps exactly once per tick, drawing inside the blank window.
+  // Returns false on timeout (e.g. the driver was never begun).
+  bool waitFrame(uint32_t timeout_ms = 100);
+
+  // Or a callback, invoked from the tick task right after each frame.
+  // Runs at priority 10 on core 0 — keep it brief (a few ms of drawing is
+  // fine; anything longer delays the next frame).
+  typedef void (*FrameCallback)(void*);
+  void onFrame(FrameCallback cb, void* arg = nullptr) {
+    _frame_cb_arg = arg;
+    _frame_cb = cb;
+  }
+
   // Block until every pixel has arrived at its target (optional).
   void waitSettled(uint32_t timeout_ms = 5000);
 
@@ -239,6 +261,9 @@ private:
   volatile uint32_t _compute_budget_us = 0;  // phase-1 cap; 0 = unlimited
   uint16_t _rowCursor = 0;     // rotating start row for budgeted phase 1
   uint16_t _tick_override = 0; // setTickRate(); applied in begin()
+  SemaphoreHandle_t _vbl_sem = nullptr;          // given once per frame
+  volatile FrameCallback _frame_cb = nullptr;    // user frame hook
+  void* _frame_cb_arg = nullptr;
   bool _rested      = false;   // pulse ≥ tick: rest ticks replace neutral pass
   bool _offBeat     = false;   // frame parity: fine pulses fire on-beat only
   bool _fineHold    = false;   // this frame, fine pixels hold (rest beat)

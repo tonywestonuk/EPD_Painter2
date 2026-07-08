@@ -86,6 +86,8 @@ public:
     void setTickRate(uint16_t hz)      { _epd.setTickRate(hz); }        // before begin()
     void setComputeBudget(uint32_t us) { _epd.setComputeBudget(us); }
     void waitSettled(uint32_t timeout_ms = 5000) { _epd.waitSettled(timeout_ms); }
+    bool waitFrame(uint32_t timeout_ms = 100) { return _epd.waitFrame(timeout_ms); }
+    void onFrame(EPD_Painter2::FrameCallback cb, void* arg = nullptr) { _epd.onFrame(cb, arg); }
     EPD_Painter2::Stats getStats()     { return _epd.getStats(); }
 
     // The underlying driver, for anything not wrapped.

@@ -307,6 +307,7 @@ bool EPD_Painter2::begin() {
   _pin_sph = new EPD2_GpioPin(uint8_t(_config.pin_sph));
 
   _draw_mtx = xSemaphoreCreateMutex();
+  if (!_vbl_sem) _vbl_sem = xSemaphoreCreateBinary();
 
   // ---- Establish a known all-white baseline ----
   powerOn();
@@ -450,6 +451,11 @@ void EPD_Painter2::touchSpan(int y, int x0, int x1) {
   if (x1 > _config.width) x1 = _config.width;
   if (x0 >= x1) return;
   markSpan(y, x0, x1);
+}
+
+bool EPD_Painter2::waitFrame(uint32_t timeout_ms) {
+  if (!_vbl_sem) return false;
+  return xSemaphoreTake(_vbl_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 void EPD_Painter2::waitSettled(uint32_t timeout_ms) {
@@ -756,5 +762,11 @@ void EPD_Painter2::_tick_task_body() {
       }
       if (++_idle_ticks >= idleOffTicks) powerOff();
     }
+
+    // Vertical blank: the frame (or idle heartbeat) is done; targets have
+    // been sampled and won't be looked at again until next period. Fire the
+    // user hooks — anything drawn from here on is picked up whole.
+    if (_frame_cb) _frame_cb(_frame_cb_arg);
+    if (_vbl_sem) xSemaphoreGive(_vbl_sem);
   }
 }

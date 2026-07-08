@@ -185,6 +185,11 @@ void setup() {
 }
 
 void loop() {
+  // waitVBL(): block until the tick finishes its frame. Everything drawn
+  // between here and the next frame is picked up whole — and the game steps
+  // exactly once per simulation tick, phase-locked, no timers needed.
+  epd.waitFrame();
+
   epd.beginUpdate();
   for (int i = 0; i < NUM_BALLS; i++) eraseBall(balls[i]);
   for (int i = 0; i < NUM_BALLS; i++) updateBall(balls[i]);
@@ -206,5 +211,4 @@ void loop() {
                   (unsigned long)s.lastTickUs, (unsigned long)s.maxTickUs, s.activeRows);
   }
 
-  delay(20);   // one game step per simulation tick (50Hz)
 }
