@@ -309,6 +309,7 @@ private:
   int      _refreshRow = -1;       // active deghost pass row, -1 = none
   int      _maintRow = 0;          // trim scan cursor
   uint32_t _maintSalt = 1;         // per-pass lottery salt
+  uint8_t  _maintDiv = 0;          // live merge runs every Nth frame
   uint8_t  _ghostGrid[GRID_MAX][GRID_MAX] = {};  // scrubs remaining per cell
   uint32_t _cellScrubbed[GRID_MAX] = {};         // cells scrubbed this pass
   int      _gridW = 0, _gridH = 0;

@@ -703,7 +703,10 @@ bool EPD_Painter2::tickFrame() {
   // of maintenance pulses into this frame when pacing and budget allow.
   // The frame type picks the pulse width: !coarse frames bank the chased
   // short pre-charges, coarse frames carry the full-tick scrubs.
+  // Throttled to every 3rd frame — deghosting is a background chore and
+  // must never cost the animation its tick budget.
   if (_dc && _white_refresh_s && _ghostAny && activeRows &&
+      (++_maintDiv % 3) == 0 &&
       esp_timer_get_time() >= _next_refresh_us &&
       (!budget || (uint32_t)(esp_timer_get_time() - p1Start) < budget)) {
     mergeMaintenance(coarse, winMs, tickMs);
@@ -800,8 +803,12 @@ void EPD_Painter2::finishGhostPass() {
 void EPD_Painter2::mergeMaintenance(bool coarse, int16_t shortMs, int16_t longMs) {
   const int H = _config.height, W = _config.width;
   _maintSalt = _maintSalt * 1103515245u + 12345u;
+  const int64_t t0 = esp_timer_get_time();
 
-  for (int n = 0; n < MAINT_BAND; n++) {
+  int done = 0;
+  for (int n = 0; n < MAINT_BAND; n++, done++) {
+    // Hard time cap: this is a background chore — never stretch the tick.
+    if ((esp_timer_get_time() - t0) > 1500) break;
     const int row = (_maintRow + n) % H;
     const uint8_t* gRow = _ghostGrid[row / GHOST_CELL];
 
@@ -849,8 +856,9 @@ void EPD_Painter2::mergeMaintenance(bool coarse, int16_t shortMs, int16_t longMs
       _st_maintPulses.fetch_add(1, std::memory_order_relaxed);
     }
   }
+  if (!done) return;
   const int prev = _maintRow;
-  _maintRow = (_maintRow + MAINT_BAND) % H;
+  _maintRow = (_maintRow + done) % H;
   if (_maintRow <= prev) finishGhostPass();      // wrapped: one pass complete
 }
 
